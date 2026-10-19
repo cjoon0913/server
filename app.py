@@ -19,7 +19,7 @@ app.add_middleware(
 # Render 환경 변수에서 로드
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 # 감시할 대상 유튜브 채널 (★원하시는 채널 핸들로 변경하세요)
-TARGET_YOUTUBE_URL = "https://www.youtube.com/@ytnnews24/live"
+TARGET_YOUTUBE_URL = "https://www.youtube.com/@sbsnews/live"
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 active_connections: list[WebSocket] = []
