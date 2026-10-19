@@ -44,42 +44,54 @@ async def broadcast(data: dict):
 def get_cookie_args():
     for path in ["/etc/secrets/cookies.txt", "cookies.txt"]:
         if os.path.exists(path) and os.path.getsize(path) > 10:
-            print(f"[쿠키 인증] {path} 파일을 정상적으로 로드했습니다.", flush=True)
+            print(f"[쿠키 인증] {path} 파일을 로드했습니다.", flush=True)
             return ["--cookies", path]
     return []
 
+# 데스크톱 웹 리로드 화면을 우회하는 모바일/TV API 직결 추출기
 def extract_stream_url(url: str):
     cookies = get_cookie_args()
 
-    # 1. 캐시 충돌 방지 및 기본 클라이언트로 쿠키 100% 활용
-    cmd_default = [
-        "yt-dlp", "-g", "-f", "ba/b",
-        "--rm-cache-dir",  # 유튜브 페이지 리로드 에러 방지용 캐시 삭제
-        "--no-warnings", *cookies, url
+    # 웹페이지 HTML 파싱을 건너뛰고 HLS 스트림을 직접 반환하는 클라이언트 순차 시도
+    client_strategies = [
+        ("iOS App", "youtube:player_client=ios;player_skip=webpage,configs"),
+        ("Android App", "youtube:player_client=android;player_skip=webpage,configs"),
+        ("Mobile Web", "youtube:player_client=mweb;player_skip=webpage"),
+        ("TV Embedded", "youtube:player_client=tv_embedded;player_skip=webpage")
     ]
-    res = subprocess.run(cmd_default, capture_output=True, text=True, timeout=25)
-    lines = [l.strip() for l in res.stdout.strip().splitlines() if l.strip()]
-    if lines:
+
+    last_error = ""
+
+    # 1. 쿠키 포함 다중 모바일 클라이언트 시도
+    for name, client_arg in client_strategies:
+        cmd = [
+            "yt-dlp", "-g", "-f", "ba/b",
+            "--extractor-args", client_arg,
+            "--no-warnings", *cookies, url
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=25)
+        lines = [l.strip() for l in res.stdout.strip().splitlines() if l.strip()]
         for line in lines:
             if "m3u8" in line or line.startswith("http"):
+                print(f"[{name} API로 스트림 주소 획득 성공!]", flush=True)
                 return 0, line, ""
+        if res.stderr.strip():
+            last_error = res.stderr.strip()
 
-    # 2. 실패 시 모바일 우회 모드로 재시도
-    cmd_mobile = [
+    # 2. 비인증 TV 클라이언트 폴백 시도
+    cmd_fallback = [
         "yt-dlp", "-g", "-f", "ba/b",
-        "--extractor-args", "youtube:player_client=android,web",
-        "--rm-cache-dir",
-        "--no-warnings", *cookies, url
+        "--extractor-args", "youtube:player_client=tv_embedded,web_embedded;player_skip=webpage",
+        "--no-warnings", url
     ]
-    res_mobile = subprocess.run(cmd_mobile, capture_output=True, text=True, timeout=25)
-    lines_mobile = [l.strip() for l in res_mobile.stdout.strip().splitlines() if l.strip()]
-    if lines_mobile:
-        for line in lines_mobile:
-            if "m3u8" in line or line.startswith("http"):
-                return 0, line, ""
+    res_fb = subprocess.run(cmd_fallback, capture_output=True, text=True, timeout=25)
+    lines_fb = [l.strip() for l in res_fb.stdout.strip().splitlines() if l.strip()]
+    for line in lines_fb:
+        if "m3u8" in line or line.startswith("http"):
+            print("[TV Embedded(공용) API로 스트림 주소 획득 성공!]", flush=True)
+            return 0, line, ""
 
-    error_msg = res.stderr.strip() or res_mobile.stderr.strip()
-    return 1, "", error_msg
+    return 1, "", last_error or res_fb.stderr.strip()
 
 def record_chunk(stream_url: str, outfile: str, duration: int = 5):
     cmd = [
@@ -98,7 +110,7 @@ async def live_audio_pipeline():
 
     while True:
         try:
-            print("[1] 유튜브 오디오 스트림 주소 파싱 중...", flush=True)
+            print("[1] 유튜브 오디오 스트림 주소 파싱 중 (웹페이지 스킵 모드)...", flush=True)
             code, stream_url, err = await asyncio.to_thread(extract_stream_url, TARGET_YOUTUBE_URL)
 
             if code != 0 or not stream_url:
@@ -132,7 +144,7 @@ async def live_audio_pipeline():
                         "time": "LIVE"
                     })
                 else:
-                    print("🔇 [음성 없음]", flush=True)
+                    print("🔇 [음성 없음/묵음]", flush=True)
 
         except Exception as e:
             print(f"[파이프라인 예외] {e}", flush=True)
