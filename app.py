@@ -17,10 +17,19 @@ app.add_middleware(
 )
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-TARGET_YOUTUBE_URL = "https://www.youtube.com/watch?v=ilWUxgMNEiY"
+TARGET_VIDEO_ID = "ilWUxgMNEiY"  # SBS 뉴스 라이브 고유 ID
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 active_connections: list[WebSocket] = []
+
+# 전 세계 공개 Invidious API 미러 노드 목록 (봇 차단 완전 우회용)
+INVIDIOUS_NODES = [
+    "https://inv.tux.pizza",
+    "https://invidious.nerdvpn.de",
+    "https://yewtu.be",
+    "https://invidious.jing.rocks",
+    "https://invidious.projectsegfau.lt"
+]
 
 async def translate_text(text: str, target_lang: str = "en") -> str:
     try:
@@ -31,7 +40,7 @@ async def translate_text(text: str, target_lang: str = "en") -> str:
             if data and data[0]:
                 return "".join([part[0] for part in data[0]])
     except Exception as e:
-        print(f"[번역 실패] {e}", flush=True)
+        print(f"[번역 예외] {e}", flush=True)
     return text
 
 async def broadcast(data: dict):
@@ -41,57 +50,48 @@ async def broadcast(data: dict):
         except Exception:
             active_connections.remove(ws)
 
-def get_cookie_args():
-    for path in ["/etc/secrets/cookies.txt", "cookies.txt"]:
-        if os.path.exists(path) and os.path.getsize(path) > 10:
-            print(f"[쿠키 인증] {path} 파일을 로드했습니다.", flush=True)
-            return ["--cookies", path]
-    return []
+# Invidious 분산 API를 통해 봇 차단 없이 실시간 m3u8 주소 추출
+async def fetch_live_stream_url(video_id: str):
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    
+    async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
+        for node in INVIDIOUS_NODES:
+            try:
+                api_url = f"{node}/api/v1/videos/{video_id}"
+                res = await client.get(api_url, headers=headers)
+                if res.status_code == 200:
+                    data = res.json()
+                    # 1. 실시간 HLS m3u8 주소가 제공되는 경우 (최우선)
+                    if "hlsUrl" in data and data["hlsUrl"]:
+                        print(f"[{node}] HLS 라이브 스트림 주소 획득 성공!", flush=True)
+                        return data["hlsUrl"]
+                    
+                    # 2. adaptiveFormats에서 오디오 스트림 추출
+                    formats = data.get("adaptiveFormats", [])
+                    for f in formats:
+                        if f.get("type", "").startswith("audio/"):
+                            print(f"[{node}] 오디오 스트림 획득 성공!", flush=True)
+                            return f.get("url")
+            except Exception:
+                continue
 
-# 데스크톱 웹 리로드 화면을 우회하는 모바일/TV API 직결 추출기
-def extract_stream_url(url: str):
-    cookies = get_cookie_args()
-
-    # 웹페이지 HTML 파싱을 건너뛰고 HLS 스트림을 직접 반환하는 클라이언트 순차 시도
-    client_strategies = [
-        ("iOS App", "youtube:player_client=ios;player_skip=webpage,configs"),
-        ("Android App", "youtube:player_client=android;player_skip=webpage,configs"),
-        ("Mobile Web", "youtube:player_client=mweb;player_skip=webpage"),
-        ("TV Embedded", "youtube:player_client=tv_embedded;player_skip=webpage")
-    ]
-
-    last_error = ""
-
-    # 1. 쿠키 포함 다중 모바일 클라이언트 시도
-    for name, client_arg in client_strategies:
+    # 폴백: yt-dlp web_embedded 직접 시도
+    try:
         cmd = [
             "yt-dlp", "-g", "-f", "ba/b",
-            "--extractor-args", client_arg,
-            "--no-warnings", *cookies, url
+            "--extractor-args", "youtube:player_client=web_embedded;player_skip=webpage",
+            "--referer", "https://www.youtube.com/",
+            f"https://www.youtube.com/watch?v={video_id}"
         ]
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=25)
-        lines = [l.strip() for l in res.stdout.strip().splitlines() if l.strip()]
-        for line in lines:
-            if "m3u8" in line or line.startswith("http"):
-                print(f"[{name} API로 스트림 주소 획득 성공!]", flush=True)
-                return 0, line, ""
-        if res.stderr.strip():
-            last_error = res.stderr.strip()
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        stream = res.stdout.strip()
+        if stream and ("m3u8" in stream or stream.startswith("http")):
+            print("[yt-dlp Embedded] 스트림 획득 성공!", flush=True)
+            return stream
+    except Exception:
+        pass
 
-    # 2. 비인증 TV 클라이언트 폴백 시도
-    cmd_fallback = [
-        "yt-dlp", "-g", "-f", "ba/b",
-        "--extractor-args", "youtube:player_client=tv_embedded,web_embedded;player_skip=webpage",
-        "--no-warnings", url
-    ]
-    res_fb = subprocess.run(cmd_fallback, capture_output=True, text=True, timeout=25)
-    lines_fb = [l.strip() for l in res_fb.stdout.strip().splitlines() if l.strip()]
-    for line in lines_fb:
-        if "m3u8" in line or line.startswith("http"):
-            print("[TV Embedded(공용) API로 스트림 주소 획득 성공!]", flush=True)
-            return 0, line, ""
-
-    return 1, "", last_error or res_fb.stderr.strip()
+    return None
 
 def record_chunk(stream_url: str, outfile: str, duration: int = 5):
     cmd = [
@@ -106,26 +106,27 @@ def record_chunk(stream_url: str, outfile: str, duration: int = 5):
 
 async def live_audio_pipeline():
     chunk_file = "stream_chunk.wav"
-    print(f"[파이프라인 가동] 대상: {TARGET_YOUTUBE_URL}", flush=True)
+    print(f"[파이프라인 가동] 대상 영상 ID: {TARGET_VIDEO_ID}", flush=True)
 
     while True:
         try:
-            print("[1] 유튜브 오디오 스트림 주소 파싱 중 (웹페이지 스킵 모드)...", flush=True)
-            code, stream_url, err = await asyncio.to_thread(extract_stream_url, TARGET_YOUTUBE_URL)
+            print("[1] 분산 API 노드를 통해 라이브 오디오 스트림 주소 파싱 중...", flush=True)
+            stream_url = await fetch_live_stream_url(TARGET_VIDEO_ID)
 
-            if code != 0 or not stream_url:
-                print(f"[오류: yt-dlp 실패] {err[:150]}", flush=True)
+            if not stream_url:
+                print("[재시도] 스트림 주소 탐색 중... 10초 후 다시 시도합니다.", flush=True)
                 await asyncio.sleep(10)
                 continue
 
-            print("[2] 스트림 주소 획득 성공! 5초 슬라이스 수신 시작", flush=True)
+            print("[2] 오디오 스트림 직결 완료! 5초 슬라이스 수신 시작", flush=True)
 
             while True:
                 rec_code = await asyncio.to_thread(record_chunk, stream_url, chunk_file, 5)
                 if rec_code != 0 or not os.path.exists(chunk_file) or os.path.getsize(chunk_file) < 1000:
-                    print("[스트림 재연결] 주소를 새로 갱신합니다.", flush=True)
+                    print("[스트림 만료] 스트림 주소를 새로 갱신합니다.", flush=True)
                     break
 
+                # Groq Whisper-large-v3 초고속 STT
                 with open(chunk_file, "rb") as f:
                     transcription = groq_client.audio.transcriptions.create(
                         file=(chunk_file, f.read()),
@@ -144,10 +145,10 @@ async def live_audio_pipeline():
                         "time": "LIVE"
                     })
                 else:
-                    print("🔇 [음성 없음/묵음]", flush=True)
+                    print("🔇 [음성 없음/묵음 구간]", flush=True)
 
         except Exception as e:
-            print(f"[파이프라인 예외] {e}", flush=True)
+            print(f"[파이프라인 루프 예외] {e}", flush=True)
             await asyncio.sleep(10)
 
 @app.on_event("startup")
