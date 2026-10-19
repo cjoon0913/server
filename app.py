@@ -1,4 +1,5 @@
 import os
+import re
 import asyncio
 import subprocess
 import httpx
@@ -17,19 +18,16 @@ app.add_middleware(
 )
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-TARGET_VIDEO_ID = "ilWUxgMNEiY"  # SBS 뉴스 라이브 고유 ID
+# 유튜브 라이브 전체 URL 또는 11자리 영상 ID 모두 지원
+TARGET_YOUTUBE = "https://www.youtube.com/watch?v=ilWUxgMNEiY"
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 active_connections: list[WebSocket] = []
 
-# 전 세계 공개 Invidious API 미러 노드 목록 (봇 차단 완전 우회용)
-INVIDIOUS_NODES = [
-    "https://inv.tux.pizza",
-    "https://invidious.nerdvpn.de",
-    "https://yewtu.be",
-    "https://invidious.jing.rocks",
-    "https://invidious.projectsegfau.lt"
-]
+def extract_video_id(url_or_id: str) -> str:
+    url_or_id = url_or_id.strip()
+    match = re.search(r"(?:v=|\/live\/|\/embed\/|youtu\.be\/|^)([a-zA-Z0-9_-]{11})", url_or_id)
+    return match.group(1) if match else url_or_id
 
 async def translate_text(text: str, target_lang: str = "en") -> str:
     try:
@@ -40,7 +38,7 @@ async def translate_text(text: str, target_lang: str = "en") -> str:
             if data and data[0]:
                 return "".join([part[0] for part in data[0]])
     except Exception as e:
-        print(f"[번역 예외] {e}", flush=True)
+        print(f"[번역 실패] {e}", flush=True)
     return text
 
 async def broadcast(data: dict):
@@ -50,46 +48,86 @@ async def broadcast(data: dict):
         except Exception:
             active_connections.remove(ws)
 
-# Invidious 분산 API를 통해 봇 차단 없이 실시간 m3u8 주소 추출
-async def fetch_live_stream_url(video_id: str):
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+# 1순위: Google 공식 Innertube API 직결 (봇 검증 완전 제외 클라이언트)
+async def fetch_via_innertube(video_id: str) -> str | None:
+    api_url = "https://www.youtube.com/youtubei/v1/player?key=AIzaSyAO_FJ2SlqU8Q4usvWRL55afuZ0fiWm3UU&prettyPrint=false"
     
-    async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
-        for node in INVIDIOUS_NODES:
+    clients = [
+        {
+            "name": "ANDROID_CREATOR",
+            "context": {"client": {"clientName": "ANDROID_CREATOR", "clientVersion": "23.49.100", "androidSdkVersion": 31, "hl": "ko", "gl": "KR"}},
+            "headers": {"User-Agent": "com.google.android.apps.youtube.creator/23.49.100 (Linux; U; Android 11)"}
+        },
+        {
+            "name": "TVHTML5",
+            "context": {"client": {"clientName": "TVHTML5", "clientVersion": "7.20230405.08.01"}},
+            "headers": {"User-Agent": "Mozilla/5.0 (SMART-TV; Linux; Tizen 6.0) AppleWebKit/538.1"}
+        },
+        {
+            "name": "WEB_EMBEDDED",
+            "context": {
+                "client": {"clientName": "WEB_EMBEDDED_PLAYER", "clientVersion": "1.20240306.01.00"},
+                "thirdParty": {"embedUrl": f"https://www.youtube.com/embed/{video_id}"}
+            },
+            "headers": {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Referer": f"https://www.youtube.com/embed/{video_id}"}
+        }
+    ]
+
+    async with httpx.AsyncClient(timeout=8.0) as http_client:
+        for c in clients:
             try:
-                api_url = f"{node}/api/v1/videos/{video_id}"
-                res = await client.get(api_url, headers=headers)
+                payload = {"context": c["context"], "videoId": video_id}
+                res = await http_client.post(api_url, json=payload, headers=c["headers"])
                 if res.status_code == 200:
                     data = res.json()
-                    # 1. 실시간 HLS m3u8 주소가 제공되는 경우 (최우선)
-                    if "hlsUrl" in data and data["hlsUrl"]:
-                        print(f"[{node}] HLS 라이브 스트림 주소 획득 성공!", flush=True)
-                        return data["hlsUrl"]
-                    
-                    # 2. adaptiveFormats에서 오디오 스트림 추출
-                    formats = data.get("adaptiveFormats", [])
-                    for f in formats:
-                        if f.get("type", "").startswith("audio/"):
-                            print(f"[{node}] 오디오 스트림 획득 성공!", flush=True)
-                            return f.get("url")
-            except Exception:
-                continue
+                    playability = data.get("playabilityStatus", {})
+                    if playability.get("status") == "OK":
+                        streaming = data.get("streamingData", {})
+                        if "hlsManifestUrl" in streaming:
+                            print(f"[{c['name']}] HLS 라이브 스트림 주소 획득 성공!", flush=True)
+                            return streaming["hlsManifestUrl"]
+                        for fmt in streaming.get("adaptiveFormats", []):
+                            if "audio" in fmt.get("mimeType", "") and "url" in fmt:
+                                print(f"[{c['name']}] 오디오 스트림 획득 성공!", flush=True)
+                                return fmt["url"]
+            except Exception as e:
+                print(f"[{c['name']} 시도 중 오류] {e}", flush=True)
+    return None
 
-    # 폴백: yt-dlp web_embedded 직접 시도
-    try:
-        cmd = [
-            "yt-dlp", "-g", "-f", "ba/b",
-            "--extractor-args", "youtube:player_client=web_embedded;player_skip=webpage",
-            "--referer", "https://www.youtube.com/",
-            f"https://www.youtube.com/watch?v={video_id}"
-        ]
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-        stream = res.stdout.strip()
-        if stream and ("m3u8" in stream or stream.startswith("http")):
-            print("[yt-dlp Embedded] 스트림 획득 성공!", flush=True)
-            return stream
-    except Exception:
-        pass
+# 2순위: yt-dlp android_creator / tv 엔진 폴백
+def fetch_via_ytdlp(video_id: str) -> str | None:
+    strategies = [
+        "youtube:player_client=android_creator;player_skip=webpage,configs",
+        "youtube:player_client=tv;player_skip=webpage,configs"
+    ]
+    for client_arg in strategies:
+        try:
+            cmd = [
+                "yt-dlp", "-g", "-f", "ba/b",
+                "--extractor-args", client_arg,
+                "--no-warnings",
+                f"https://www.youtube.com/watch?v={video_id}"
+            ]
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+            lines = [l.strip() for l in res.stdout.strip().splitlines() if l.strip()]
+            for line in lines:
+                if "m3u8" in line or line.startswith("http"):
+                    print(f"[yt-dlp {client_arg.split(';')[0]}] 스트림 획득 성공!", flush=True)
+                    return line
+        except Exception:
+            pass
+    return None
+
+async def get_live_stream_url(video_id: str) -> str | None:
+    # 1. Innertube 공식 직결
+    stream = await fetch_via_innertube(video_id)
+    if stream:
+        return stream
+
+    # 2. yt-dlp 우회 엔진 폴백
+    stream = await asyncio.to_thread(fetch_via_ytdlp, video_id)
+    if stream:
+        return stream
 
     return None
 
@@ -106,27 +144,27 @@ def record_chunk(stream_url: str, outfile: str, duration: int = 5):
 
 async def live_audio_pipeline():
     chunk_file = "stream_chunk.wav"
-    print(f"[파이프라인 가동] 대상 영상 ID: {TARGET_VIDEO_ID}", flush=True)
+    video_id = extract_video_id(TARGET_YOUTUBE)
+    print(f"[파이프라인 가동] 대상 영상 ID: {video_id}", flush=True)
 
     while True:
         try:
-            print("[1] 분산 API 노드를 통해 라이브 오디오 스트림 주소 파싱 중...", flush=True)
-            stream_url = await fetch_live_stream_url(TARGET_VIDEO_ID)
+            print("[1] YouTube Innertube 직결로 실시간 오디오 스트림 주소 파싱 중...", flush=True)
+            stream_url = await get_live_stream_url(video_id)
 
             if not stream_url:
-                print("[재시도] 스트림 주소 탐색 중... 10초 후 다시 시도합니다.", flush=True)
-                await asyncio.sleep(10)
+                print("[재시도] 스트림 주소 탐색 중... 5초 후 다시 시도합니다.", flush=True)
+                await asyncio.sleep(5)
                 continue
 
-            print("[2] 오디오 스트림 직결 완료! 5초 슬라이스 수신 시작", flush=True)
+            print("[2] 실시간 오디오 스트림 수신 시작 (5초 슬라이스)", flush=True)
 
             while True:
                 rec_code = await asyncio.to_thread(record_chunk, stream_url, chunk_file, 5)
                 if rec_code != 0 or not os.path.exists(chunk_file) or os.path.getsize(chunk_file) < 1000:
-                    print("[스트림 만료] 스트림 주소를 새로 갱신합니다.", flush=True)
+                    print("[스트림 만료] 스트림 주소를 갱신합니다.", flush=True)
                     break
 
-                # Groq Whisper-large-v3 초고속 STT
                 with open(chunk_file, "rb") as f:
                     transcription = groq_client.audio.transcriptions.create(
                         file=(chunk_file, f.read()),
@@ -145,11 +183,11 @@ async def live_audio_pipeline():
                         "time": "LIVE"
                     })
                 else:
-                    print("🔇 [음성 없음/묵음 구간]", flush=True)
+                    print("🔇 [음성 없음 / 배경음]", flush=True)
 
         except Exception as e:
-            print(f"[파이프라인 루프 예외] {e}", flush=True)
-            await asyncio.sleep(10)
+            print(f"[파이프라인 루프 오류] {e}", flush=True)
+            await asyncio.sleep(5)
 
 @app.on_event("startup")
 async def startup_event():
