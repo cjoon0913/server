@@ -18,11 +18,13 @@ app.add_middleware(
 )
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-# 유튜브 라이브 전체 URL 또는 11자리 영상 ID 모두 지원
 TARGET_YOUTUBE = "https://www.youtube.com/watch?v=ilWUxgMNEiY"
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 active_connections: list[WebSocket] = []
+
+# Edge 브라우저 User-Agent (쿠키 세션 불일치 에러 방지용)
+EDGE_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0"
 
 def extract_video_id(url_or_id: str) -> str:
     url_or_id = url_or_id.strip()
@@ -48,85 +50,115 @@ async def broadcast(data: dict):
         except Exception:
             active_connections.remove(ws)
 
-# 1순위: Google 공식 Innertube API 직결 (봇 검증 완전 제외 클라이언트)
-async def fetch_via_innertube(video_id: str) -> str | None:
-    api_url = "https://www.youtube.com/youtubei/v1/player?key=AIzaSyAO_FJ2SlqU8Q4usvWRL55afuZ0fiWm3UU&prettyPrint=false"
-    
-    clients = [
-        {
-            "name": "ANDROID_CREATOR",
-            "context": {"client": {"clientName": "ANDROID_CREATOR", "clientVersion": "23.49.100", "androidSdkVersion": 31, "hl": "ko", "gl": "KR"}},
-            "headers": {"User-Agent": "com.google.android.apps.youtube.creator/23.49.100 (Linux; U; Android 11)"}
-        },
-        {
-            "name": "TVHTML5",
-            "context": {"client": {"clientName": "TVHTML5", "clientVersion": "7.20230405.08.01"}},
-            "headers": {"User-Agent": "Mozilla/5.0 (SMART-TV; Linux; Tizen 6.0) AppleWebKit/538.1"}
-        },
-        {
-            "name": "WEB_EMBEDDED",
-            "context": {
-                "client": {"clientName": "WEB_EMBEDDED_PLAYER", "clientVersion": "1.20240306.01.00"},
-                "thirdParty": {"embedUrl": f"https://www.youtube.com/embed/{video_id}"}
-            },
-            "headers": {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Referer": f"https://www.youtube.com/embed/{video_id}"}
-        }
-    ]
-
-    async with httpx.AsyncClient(timeout=8.0) as http_client:
-        for c in clients:
-            try:
-                payload = {"context": c["context"], "videoId": video_id}
-                res = await http_client.post(api_url, json=payload, headers=c["headers"])
-                if res.status_code == 200:
-                    data = res.json()
-                    playability = data.get("playabilityStatus", {})
-                    if playability.get("status") == "OK":
-                        streaming = data.get("streamingData", {})
-                        if "hlsManifestUrl" in streaming:
-                            print(f"[{c['name']}] HLS 라이브 스트림 주소 획득 성공!", flush=True)
-                            return streaming["hlsManifestUrl"]
-                        for fmt in streaming.get("adaptiveFormats", []):
-                            if "audio" in fmt.get("mimeType", "") and "url" in fmt:
-                                print(f"[{c['name']}] 오디오 스트림 획득 성공!", flush=True)
-                                return fmt["url"]
-            except Exception as e:
-                print(f"[{c['name']} 시도 중 오류] {e}", flush=True)
+def get_cookie_file():
+    for path in ["/etc/secrets/cookies.txt", "cookies.txt"]:
+        if os.path.exists(path) and os.path.getsize(path) > 10:
+            return path
     return None
 
-# 2순위: yt-dlp android_creator / tv 엔진 폴백
-def fetch_via_ytdlp(video_id: str) -> str | None:
-    strategies = [
-        "youtube:player_client=android_creator;player_skip=webpage,configs",
-        "youtube:player_client=tv;player_skip=webpage,configs"
-    ]
-    for client_arg in strategies:
-        try:
-            cmd = [
-                "yt-dlp", "-g", "-f", "ba/b",
-                "--extractor-args", client_arg,
-                "--no-warnings",
-                f"https://www.youtube.com/watch?v={video_id}"
-            ]
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
-            lines = [l.strip() for l in res.stdout.strip().splitlines() if l.strip()]
-            for line in lines:
-                if "m3u8" in line or line.startswith("http"):
-                    print(f"[yt-dlp {client_arg.split(';')[0]}] 스트림 획득 성공!", flush=True)
-                    return line
-        except Exception:
-            pass
+# 1. Innertube ANDROID_VR 직결 (봇 검증을 건너뛰는 전용 API)
+async def fetch_innertube_vr(video_id: str) -> str | None:
+    api_url = "https://www.youtube.com/youtubei/v1/player?prettyPrint=false"
+    payload = {
+        "context": {
+            "client": {
+                "clientName": "ANDROID_VR",
+                "clientVersion": "1.56.21",
+                "deviceMake": "Oculus",
+                "deviceModel": "Quest 3",
+                "osName": "Android",
+                "osVersion": "12",
+                "hl": "ko",
+                "gl": "KR"
+            }
+        },
+        "videoId": video_id
+    }
+    headers = {
+        "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 12; Quest 3 Build/SQ3A.220605.009.A1)",
+        "Content-Type": "application/json"
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            res = await client.post(api_url, json=payload, headers=headers)
+            if res.status_code == 200:
+                data = res.json()
+                playability = data.get("playabilityStatus", {})
+                status = playability.get("status")
+                reason = playability.get("reason", "")
+                
+                print(f"[Innertube VR 진단] 상태: {status} / 사유: {reason}", flush=True)
+
+                if status == "OK":
+                    streaming = data.get("streamingData", {})
+                    if "hlsManifestUrl" in streaming:
+                        return streaming["hlsManifestUrl"]
+                    for fmt in streaming.get("adaptiveFormats", []):
+                        if "audio" in fmt.get("mimeType", "") and "url" in fmt:
+                            return fmt["url"]
+    except Exception as e:
+        print(f"[Innertube VR 요청 예외] {e}", flush=True)
     return None
 
-async def get_live_stream_url(video_id: str) -> str | None:
-    # 1. Innertube 공식 직결
-    stream = await fetch_via_innertube(video_id)
+# 2. yt-dlp android_vr 클라이언트 우회
+def fetch_ytdlp_vr(url: str) -> str | None:
+    cmd = [
+        "yt-dlp", "-g", "-f", "ba/b",
+        "--extractor-args", "youtube:player_client=android_vr;player_skip=webpage,configs",
+        "--no-warnings", url
+    ]
+    res = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+    lines = [l.strip() for l in res.stdout.strip().splitlines() if l.strip()]
+    for line in lines:
+        if "m3u8" in line or line.startswith("http"):
+            return line
+    if res.stderr.strip():
+        print(f"[yt-dlp VR 오류] {res.stderr.strip()[:120]}", flush=True)
+    return None
+
+# 3. yt-dlp 쿠키 + Edge 헤더 결합 폴백
+def fetch_ytdlp_cookie_edge(url: str) -> str | None:
+    cookie_path = get_cookie_file()
+    if not cookie_path:
+        return None
+
+    cmd = [
+        "yt-dlp", "-g", "-f", "ba/b",
+        "--cookies", cookie_path,
+        "--user-agent", EDGE_USER_AGENT,
+        "--extractor-args", "youtube:player_client=mweb;player_skip=webpage",
+        "--no-warnings", url
+    ]
+    res = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+    lines = [l.strip() for l in res.stdout.strip().splitlines() if l.strip()]
+    for line in lines:
+        if "m3u8" in line or line.startswith("http"):
+            return line
+    if res.stderr.strip():
+        print(f"[yt-dlp 쿠키+Edge 오류] {res.stderr.strip()[:120]}", flush=True)
+    return None
+
+async def resolve_stream(url_or_id: str) -> str | None:
+    video_id = extract_video_id(url_or_id)
+    watch_url = f"https://www.youtube.com/watch?v={video_id}"
+
+    # 1단계: ANDROID_VR Innertube 직결
+    stream = await fetch_innertube_vr(video_id)
     if stream:
+        print(">> [성공] ANDROID_VR 직결로 라이브 스트림 획득", flush=True)
         return stream
 
-    # 2. yt-dlp 우회 엔진 폴백
-    stream = await asyncio.to_thread(fetch_via_ytdlp, video_id)
+    # 2단계: yt-dlp VR 클라이언트
+    stream = await asyncio.to_thread(fetch_ytdlp_vr, watch_url)
     if stream:
+        print(">> [성공] yt-dlp android_vr 클라이언트로 스트림 획득", flush=True)
+        return stream
+
+    # 3단계: 쿠키 + Edge User-Agent 결합
+    stream = await asyncio.to_thread(fetch_ytdlp_cookie_edge, watch_url)
+    if stream:
+        print(">> [성공] yt-dlp 쿠키/Edge 결합으로 스트림 획득", flush=True)
         return stream
 
     return None
@@ -144,25 +176,24 @@ def record_chunk(stream_url: str, outfile: str, duration: int = 5):
 
 async def live_audio_pipeline():
     chunk_file = "stream_chunk.wav"
-    video_id = extract_video_id(TARGET_YOUTUBE)
-    print(f"[파이프라인 가동] 대상 영상 ID: {video_id}", flush=True)
+    print(f"[파이프라인 가동] 대상: {TARGET_YOUTUBE}", flush=True)
 
     while True:
         try:
-            print("[1] YouTube Innertube 직결로 실시간 오디오 스트림 주소 파싱 중...", flush=True)
-            stream_url = await get_live_stream_url(video_id)
+            print("[1] 라이브 오디오 스트림 탐색 시작...", flush=True)
+            stream_url = await resolve_stream(TARGET_YOUTUBE)
 
             if not stream_url:
-                print("[재시도] 스트림 주소 탐색 중... 5초 후 다시 시도합니다.", flush=True)
-                await asyncio.sleep(5)
+                print("[대기] 스트림 획득 실패. 6초 후 재시도합니다.", flush=True)
+                await asyncio.sleep(6)
                 continue
 
-            print("[2] 실시간 오디오 스트림 수신 시작 (5초 슬라이스)", flush=True)
+            print("[2] 실시간 오디오 슬라이스 수신 및 통역 가동!", flush=True)
 
             while True:
                 rec_code = await asyncio.to_thread(record_chunk, stream_url, chunk_file, 5)
                 if rec_code != 0 or not os.path.exists(chunk_file) or os.path.getsize(chunk_file) < 1000:
-                    print("[스트림 만료] 스트림 주소를 갱신합니다.", flush=True)
+                    print("[스트림 만료] 새 스트림 주소로 갱신합니다.", flush=True)
                     break
 
                 with open(chunk_file, "rb") as f:
@@ -183,10 +214,10 @@ async def live_audio_pipeline():
                         "time": "LIVE"
                     })
                 else:
-                    print("🔇 [음성 없음 / 배경음]", flush=True)
+                    print("🔇 [음성 없음 / 묵음 구간]", flush=True)
 
         except Exception as e:
-            print(f"[파이프라인 루프 오류] {e}", flush=True)
+            print(f"[파이프라인 예외 발생] {e}", flush=True)
             await asyncio.sleep(5)
 
 @app.on_event("startup")
