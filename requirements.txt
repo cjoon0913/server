@@ -1,0 +1,6 @@
+fastapi
+uvicorn[standard]
+websockets
+yt-dlp
+groq
+httpx
