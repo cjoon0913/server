@@ -17,8 +17,6 @@ app.add_middleware(
 )
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-
-# ★ 중요: 채널 핸들(@sbsnews/live) 대신 유튜브에서 지금 재생 중인 SBS 라이브의 실제 영상 주소(watch?v=...)를 넣는 것이 가장 확실합니다.
 TARGET_YOUTUBE_URL = "https://www.youtube.com/watch?v=ilWUxgMNEiY"
 
 groq_client = Groq(api_key=GROQ_API_KEY)
@@ -43,14 +41,43 @@ async def broadcast(data: dict):
         except Exception:
             active_connections.remove(ws)
 
+# 데이터센터 IP 봇 차단 우회 추출 함수
 def extract_stream_url(url: str):
-    cmd = ["yt-dlp", "-g", "-f", "ba/b", "--no-warnings", url]
-    res = subprocess.run(cmd, capture_output=True, text=True, timeout=25)
-    return res.returncode, res.stdout.strip(), res.stderr.strip()
+    # 1차 시도: iOS 모바일 클라이언트로 봇 검증 우회
+    cmd_ios = [
+        "yt-dlp", "-g", "-f", "ba/b",
+        "--extractor-args", "youtube:player_client=ios,android,mweb",
+        "--no-warnings", url
+    ]
+    res = subprocess.run(cmd_ios, capture_output=True, text=True, timeout=25)
+    lines = [line.strip() for line in res.stdout.strip().splitlines() if line.strip()]
+    if lines:
+        for line in lines:
+            if "m3u8" in line:
+                return 0, line, ""
+        return 0, lines[0], ""
+
+    # 2차 시도: TV 임베디드 클라이언트로 2중 우회
+    cmd_tv = [
+        "yt-dlp", "-g", "-f", "ba/b",
+        "--extractor-args", "youtube:player_client=tv_embedded,web_embedded",
+        "--no-warnings", url
+    ]
+    res_tv = subprocess.run(cmd_tv, capture_output=True, text=True, timeout=25)
+    lines_tv = [line.strip() for line in res_tv.stdout.strip().splitlines() if line.strip()]
+    if lines_tv:
+        for line in lines_tv:
+            if "m3u8" in line:
+                return 0, line, ""
+        return 0, lines_tv[0], ""
+
+    return res.returncode, "", res.stderr.strip()
 
 def record_chunk(stream_url: str, outfile: str, duration: int = 5):
     cmd = [
-        "ffmpeg", "-y", "-i", stream_url,
+        "ffmpeg", "-y",
+        "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "3",
+        "-i", stream_url,
         "-t", str(duration), "-ar", "16000", "-ac", "1",
         "-c:a", "pcm_s16le", outfile
     ]
@@ -60,16 +87,15 @@ def record_chunk(stream_url: str, outfile: str, duration: int = 5):
 async def live_audio_pipeline():
     chunk_file = "stream_chunk.wav"
     print(f"[파이프라인 가동] 대상: {TARGET_YOUTUBE_URL}", flush=True)
-    
+
     while True:
         try:
-            print("[1] 유튜브 오디오 스트림 주소 파싱 중...", flush=True)
+            print("[1] 유튜브 오디오 스트림 주소 파싱 중 (모바일 우회 적용)...", flush=True)
             code, stream_url, err = await asyncio.to_thread(extract_stream_url, TARGET_YOUTUBE_URL)
-            
+
             if code != 0 or not stream_url:
                 print(f"[오류: yt-dlp 실패] {err[:150]}", flush=True)
-                print("[안내] 채널 주소 대신 실제 재생 영상 링크(watch?v=...)를 사용해 주세요. 15초 후 재시도합니다.", flush=True)
-                await asyncio.sleep(15)
+                await asyncio.sleep(10)
                 continue
 
             print("[2] 스트림 주소 획득 성공! 5초 슬라이스 수신 시작", flush=True)
@@ -77,7 +103,7 @@ async def live_audio_pipeline():
             while True:
                 rec_code = await asyncio.to_thread(record_chunk, stream_url, chunk_file, 5)
                 if rec_code != 0 or not os.path.exists(chunk_file) or os.path.getsize(chunk_file) < 1000:
-                    print("[재연결 필요] 스트림이 만료되었거나 끊겼습니다. 주소를 재갱신합니다.", flush=True)
+                    print("[스트림 재연결] 주소를 새로 갱신합니다.", flush=True)
                     break
 
                 with open(chunk_file, "rb") as f:
@@ -98,7 +124,7 @@ async def live_audio_pipeline():
                         "time": "LIVE"
                     })
                 else:
-                    print("🔇 [음성 없음/배경음악]", flush=True)
+                    print("🔇 [음성 없음]", flush=True)
 
         except Exception as e:
             print(f"[파이프라인 예외] {e}", flush=True)
