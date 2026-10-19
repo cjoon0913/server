@@ -41,37 +41,60 @@ async def broadcast(data: dict):
         except Exception:
             active_connections.remove(ws)
 
-# 데이터센터 IP 봇 차단 우회 추출 함수
-def extract_stream_url(url: str):
-    # 1차 시도: iOS 모바일 클라이언트로 봇 검증 우회
-    cmd_ios = [
-        "yt-dlp", "-g", "-f", "ba/b",
-        "--extractor-args", "youtube:player_client=ios,android,mweb",
-        "--no-warnings", url
-    ]
-    res = subprocess.run(cmd_ios, capture_output=True, text=True, timeout=25)
-    lines = [line.strip() for line in res.stdout.strip().splitlines() if line.strip()]
-    if lines:
-        for line in lines:
-            if "m3u8" in line:
-                return 0, line, ""
-        return 0, lines[0], ""
+def get_cookie_args():
+    # Render Secret Files 또는 로컬 경로에 cookies.txt가 있으면 자동 주입
+    for path in ["/etc/secrets/cookies.txt", "cookies.txt"]:
+        if os.path.exists(path) and os.path.getsize(path) > 10:
+            print(f"[쿠키 인증] {path} 파일을 로드하여 봇 탐지를 우회합니다.", flush=True)
+            return ["--cookies", path]
+    return []
 
-    # 2차 시도: TV 임베디드 클라이언트로 2중 우회
+# 웹페이지 HTML 다운로드를 완전 생략하고 TV/Android API로 직접 m3u8 추출
+def extract_stream_url(url: str):
+    cookies = get_cookie_args()
+
+    # 1차 시도: Smart TV 클라이언트 (스마트 TV는 봇 검증 JS가 작동하지 않음)
     cmd_tv = [
         "yt-dlp", "-g", "-f", "ba/b",
-        "--extractor-args", "youtube:player_client=tv_embedded,web_embedded",
-        "--no-warnings", url
+        "--extractor-args", "youtube:player_client=tv_embedded,tv;player_skip=webpage,configs",
+        "--no-warnings", *cookies, url
     ]
     res_tv = subprocess.run(cmd_tv, capture_output=True, text=True, timeout=25)
-    lines_tv = [line.strip() for line in res_tv.stdout.strip().splitlines() if line.strip()]
+    lines_tv = [l.strip() for l in res_tv.stdout.strip().splitlines() if l.strip()]
     if lines_tv:
         for line in lines_tv:
-            if "m3u8" in line:
+            if "m3u8" in line or line.startswith("http"):
                 return 0, line, ""
-        return 0, lines_tv[0], ""
 
-    return res.returncode, "", res.stderr.strip()
+    # 2차 시도: Android Innertube API
+    cmd_android = [
+        "yt-dlp", "-g", "-f", "ba/b",
+        "--extractor-args", "youtube:player_client=android;player_skip=webpage,configs",
+        "--no-warnings", *cookies, url
+    ]
+    res_android = subprocess.run(cmd_android, capture_output=True, text=True, timeout=25)
+    lines_android = [l.strip() for l in res_android.stdout.strip().splitlines() if l.strip()]
+    if lines_android:
+        for line in lines_android:
+            if "m3u8" in line or line.startswith("http"):
+                return 0, line, ""
+
+    # 3차 시도: Web Embedded
+    cmd_embed = [
+        "yt-dlp", "-g", "-f", "ba/b",
+        "--extractor-args", "youtube:player_client=web_embedded;player_skip=webpage",
+        "--referer", "https://www.google.com/",
+        "--no-warnings", *cookies, url
+    ]
+    res_embed = subprocess.run(cmd_embed, capture_output=True, text=True, timeout=25)
+    lines_embed = [l.strip() for l in res_embed.stdout.strip().splitlines() if l.strip()]
+    if lines_embed:
+        for line in lines_embed:
+            if "m3u8" in line or line.startswith("http"):
+                return 0, line, ""
+
+    error_msg = res_tv.stderr.strip() or res_android.stderr.strip() or res_embed.stderr.strip()
+    return 1, "", error_msg
 
 def record_chunk(stream_url: str, outfile: str, duration: int = 5):
     cmd = [
@@ -90,7 +113,7 @@ async def live_audio_pipeline():
 
     while True:
         try:
-            print("[1] 유튜브 오디오 스트림 주소 파싱 중 (모바일 우회 적용)...", flush=True)
+            print("[1] 유튜브 오디오 스트림 주소 파싱 중 (TV/Android 직결)...", flush=True)
             code, stream_url, err = await asyncio.to_thread(extract_stream_url, TARGET_YOUTUBE_URL)
 
             if code != 0 or not stream_url:
